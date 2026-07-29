@@ -5,10 +5,13 @@ from tavily import AsyncTavilyClient
 from app.contract import node
 from app.config import (
     TAVILY_API_KEY, TAVILY_MAX_RESULTS, TAVILY_SEARCH_DEPTH,
-    RAG_BASE_URL, RAG_MIN_SCORE, RAG_TIMEOUT,
+    RAG_BASE_URL, RAG_MIN_SCORE, RAG_TIMEOUT, TOP_K, CRITIC_MODEL,
 )
 
 from app.research_state import ResearchState
+from langchain_core.messages import SystemMessage, HumanMessage   
+from app.llm import get_llm
+
 
 
 def _sigmoid(logit: float) -> float:
@@ -35,6 +38,14 @@ def _as_doc_result(chunk: dict) -> dict:
         "score": _sigmoid(float(chunk.get("rerank_score") or -20.0)),
     }
 
+def _effective_queries(state: ResearchState) -> list[str]:
+    """Retrieval queries, extended with critic feedback on a retry pass."""
+    subs = state["sub_questions"]
+    feedback = state.get("critic_feedback", "")
+    if not feedback:
+        return subs
+    return subs + [feedback]
+
 @node
 def query_analyzer(state: ResearchState) -> dict:
     """Split the question into sub-questions. STUB."""
@@ -47,7 +58,7 @@ def query_analyzer(state: ResearchState) -> dict:
 @node
 async def tavily_search(state: ResearchState) -> dict:
     """Web retrieval across all sub-questions concurrently (Simplified Version)."""
-    sub_questions_list = state["sub_questions"]
+    sub_questions_list = _effective_queries(state)
     print(f"[tavily]     START  ({len(sub_questions_list)} sub-question(s))")
 
     try:
@@ -88,14 +99,14 @@ async def tavily_search(state: ResearchState) -> dict:
 @node
 async def rag_retrieval(state: ResearchState) -> dict:
     """Document retrieval from the hybrid RAG service (Simplified Version)."""
-    sub_questions_list = state["sub_questions"]
+    sub_questions_list = _effective_queries(state)
     print(f"[rag]        START  ({len(sub_questions_list)} sub-question(s))")
 
     try:
         async with httpx.AsyncClient(timeout=RAG_TIMEOUT) as client:
 
             # Helper function: queries RAG service for a SINGLE query string
-            async def fetch_docs_for_single_query(query_text: str) -> list[dict]:
+            async def search_single_query(query_text: str) -> list[dict]:
                 response = await client.post(
                     f"{RAG_BASE_URL}/query",
                     json={"question": query_text},
@@ -108,7 +119,7 @@ async def rag_retrieval(state: ResearchState) -> dict:
 
             # Execute RAG requests concurrently across all sub-questions
             async_tasks = [
-                fetch_docs_for_single_query(query) 
+                search_single_query(query) 
                 for query in sub_questions_list
             ]
             batches_of_chunks = await asyncio.gather(*async_tasks)
@@ -141,10 +152,131 @@ async def rag_retrieval(state: ResearchState) -> dict:
 
 @node
 def merge_and_rank(state: ResearchState) -> dict:
-    """Dedupe and rank. STUB — passthrough, but reports what it received."""
+    """Dedupe across sources, rank by score, keep the top K."""
     raw = state["raw_results"]
-    by_type = {}
-    for r in raw:
-        by_type[r["source_type"]] = by_type.get(r["source_type"], 0) + 1
-    print(f"[merge]      received {len(raw)} result(s): {by_type}")
-    return {"ranked_results": raw[:5]}
+
+    # --- dedupe, keeping the highest-scored copy of each source ---
+    best_by_key: dict[str, dict] = {}
+    for result in raw:
+        key = (result.get("url") or "").rstrip("/")
+        if not key:
+            continue
+        existing = best_by_key.get(key)
+        if existing is None or result["score"] > existing["score"]:
+            best_by_key[key] = result
+
+    deduped = list(best_by_key.values())
+    duplicates_removed = len(raw) - len(deduped)
+
+    # --- rank across both sources ---
+    ranked = sorted(deduped, key=lambda r: r["score"], reverse=True)
+    top = ranked[:TOP_K]
+
+    # --- diagnostics ---
+    print(f"[merge]      in={len(raw)} deduped={len(deduped)} "
+          f"({duplicates_removed} duplicate(s) removed)")
+    for source_type in ("web", "doc"):
+        scores = [r["score"] for r in deduped if r["source_type"] == source_type]
+        if scores:
+            print(f"[merge]      {source_type}: n={len(scores)} "
+                  f"min={min(scores):.3f} max={max(scores):.3f}")
+    composition = {}
+    for r in top:
+        composition[r["source_type"]] = composition.get(r["source_type"], 0) + 1
+    print(f"[merge]      top-{len(top)} composition: {composition}")
+
+    return {"ranked_results": top}
+
+
+CRITIC_SYSTEM = """You judge whether a set of retrieved sources is sufficient \
+to answer a research question. You do not answer the question yourself.
+
+Reply in exactly this format, with no other text:
+
+VERDICT: PASS
+FEEDBACK: <one sentence>
+
+or
+
+VERDICT: FAIL
+FEEDBACK: <what is missing, and what to search for instead>
+
+Reply PASS when the sources collectively cover every part of the question. \
+Partial coverage of every part is acceptable — you are judging sufficiency, \
+not completeness.
+
+Reply FAIL only for a specific, nameable gap. Examples of real gaps:
+- The question compares two things and sources cover only one of them.
+- The question asks about a time period no source addresses.
+- The question asks "why" or "how" and sources give only "what".
+- Every source restates the same single fact, so nothing corroborates it.
+
+Do NOT reply FAIL because sources could hypothetically be more numerous, \
+more recent, or more authoritative. That is always true and is not a gap.
+
+When you reply FAIL, your feedback must name a concrete search that would \
+close the gap. Feedback like "more comprehensive sources needed" is useless \
+and counts as a PASS instead."""
+
+
+def _parse_critic(raw: str) -> tuple[str, str]:
+    """Extract (verdict, feedback) from the critic's response."""
+    verdict = "PASS"          # safe default: don't loop on a parse failure
+    feedback = ""
+
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if line.upper().startswith("VERDICT:"):
+            value = line.split(":", 1)[1].strip().upper()
+            verdict = "FAIL" if "FAIL" in value else "PASS"
+        elif line.upper().startswith("FEEDBACK:"):
+            feedback = line.split(":", 1)[1].strip()
+
+    if verdict == "FAIL" and not feedback:
+        print("[critic]     WARN FAIL with no feedback -> treating as PASS")
+        return "PASS", ""
+
+    return verdict, feedback
+
+
+@node
+def critic(state: ResearchState) -> dict:
+    """Judge source sufficiency. Sole writer of correction_count."""
+    question = state["question"]
+    results = state["ranked_results"]
+    count = state["correction_count"]
+
+    if not results:
+        print(f"[critic]     no sources -> PASS (nothing to retry with)")
+        return {
+            "critic_verdict": "PASS",
+            "critic_feedback": "",
+            "correction_count": count ,
+        }
+
+    llm = get_llm(CRITIC_MODEL, temperature=0.0)
+
+    sources_block = "\n\n".join(
+        f"[{i}] ({r['source_type']}, score {r['score']:.2f}) {r['title']}\n"
+        f"    {r['content'][:500]}"
+        for i, r in enumerate(results, start=1)
+    )
+
+    response = llm.invoke([
+        SystemMessage(content=CRITIC_SYSTEM),
+        HumanMessage(content=f"Question: {question}\n\nSources:\n{sources_block}"),
+    ])
+
+    verdict, feedback = _parse_critic(response.content)
+
+    new_count = count + 1 if verdict == "FAIL" else count
+
+    print(f"[critic]     {verdict}  (corrections requested: {new_count})")
+    if verdict == "FAIL":
+        print(f"[critic]     feedback: {feedback[:120]}")
+
+    return {
+        "critic_verdict": verdict,
+        "critic_feedback": feedback,
+        "correction_count": new_count,
+    }

@@ -18,3 +18,8 @@ TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic")
 RAG_BASE_URL = os.getenv("RAG_BASE_URL", "http://localhost:8000")
 RAG_MIN_SCORE = float(os.getenv("RAG_MIN_SCORE", "0.5"))
 RAG_TIMEOUT = float(os.getenv("RAG_TIMEOUT", "15"))
+
+TOP_K = int(os.getenv("TOP_K", "5"))
+
+CRITIC_MODEL = os.getenv("CRITIC_MODEL", "gpt-4o-mini")
+MAX_CORRECTIONS = int(os.getenv("MAX_CORRECTIONS", "2"))

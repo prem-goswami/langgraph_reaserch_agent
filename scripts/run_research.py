@@ -29,10 +29,13 @@ async def main():
     print("=" * 70)
 
     t0 = time.perf_counter()
-    async for step in app.astream(initial_state):
-        for name, update in step.items():
-            print(f"  SUPERSTEP -> {{{name}: {list(update.keys())}}}")
-    print(f"\nwall clock: {time.perf_counter() - t0:.2f}s")
+    try:
+        async for step in app.astream(initial_state):
+            for name, update in step.items():
+                print(f"  SUPERSTEP -> {{{name}: {list(update.keys())}}}")
+    finally:
+        elapsed = time.perf_counter() - t0
+        print(f"\nwall clock: {elapsed:.2f}s", flush=True)
 
 
 if __name__ == "__main__":
