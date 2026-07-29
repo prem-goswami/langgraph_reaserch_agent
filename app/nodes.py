@@ -3,8 +3,7 @@ from langchain_core.messages import SystemMessage, HumanMessage
 from app.config import ROUTER_MODEL, VALID_ROUTES, DEFAULT_ROUTE, TAVILY_MAX_RESULTS,TAVILY_SEARCH_DEPTH, GENERATION_MODEL
 from app.llm import get_llm
 from app.search import get_tavily
-import functools
-
+from app.contract import node
 
 ROUTER_SYSTEM = """You are a routing classifier. Decide whether answering the \
 user's question requires a live web search.
@@ -76,18 +75,6 @@ def _format_sources(results: list[dict]) -> str:
     for i, r in enumerate(results, start=1):
         lines.append(f"[{i}] {r['title']}\n    {r['url']}\n    {r['content']}")
     return "\n\n".join(lines)
-
-def node(fn):
-    """Enforce the node contract: must return a dict."""
-    @functools.wraps(fn)
-    def wrapper(state):
-        result = fn(state)
-        if not isinstance(result, dict):
-            raise TypeError(
-                f"node {fn.__name__!r} returned {type(result).__name__}, expected dict"
-            )
-        return result
-    return wrapper
 
 @node
 def router(state: WarmupState) -> dict:
