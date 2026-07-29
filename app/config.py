@@ -11,3 +11,6 @@ GENERATION_MODEL = os.getenv("GENERATION_MODEL", "gpt-4o-mini")
 
 VALID_ROUTES = {"search", "generate"}
 DEFAULT_ROUTE = "search"
+
+TAVILY_MAX_RESULTS = int(os.getenv("TAVILY_MAX_RESULTS", "5"))
+TAVILY_SEARCH_DEPTH = os.getenv("TAVILY_SEARCH_DEPTH", "basic")

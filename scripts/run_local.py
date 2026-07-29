@@ -20,8 +20,15 @@ print("=" * 70)
 final = None
 for step in app.stream(initial_state):
     for node_name, update in step.items():
-        print(f"  [{node_name}] -> {list(update.keys())}")
+        if update is None:
+            print(f"  [{node_name}] -> RETURNED NONE (expected a dict)")
+        elif not isinstance(update, dict):
+            print(f"  [{node_name}] -> RETURNED {type(update).__name__}: {update!r}")
+        else:
+            print(f"  [{node_name}] -> {list(update.keys())}")
     final = step
+answer = (final or {}).get("generation", {}).get("answer")
+print(answer or "(no answer produced)")
 
 print()
 print("=" * 70)

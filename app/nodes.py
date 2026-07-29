@@ -1,7 +1,9 @@
 from app.state import WarmupState
 from langchain_core.messages import SystemMessage, HumanMessage
-from app.config import ROUTER_MODEL, VALID_ROUTES, DEFAULT_ROUTE
+from app.config import ROUTER_MODEL, VALID_ROUTES, DEFAULT_ROUTE, TAVILY_MAX_RESULTS,TAVILY_SEARCH_DEPTH, GENERATION_MODEL
 from app.llm import get_llm
+from app.search import get_tavily
+import functools
 
 
 ROUTER_SYSTEM = """You are a routing classifier. Decide whether answering the \
@@ -27,6 +29,29 @@ A confidently outdated answer costs the user's trust.
 
 Reply with the single word only. No punctuation. No explanation."""
 
+GENERATION_SYSTEM = """You answer questions using the sources provided.
+
+Rules:
+- Ground every factual claim in the sources. Cite with bracketed numbers: [1], [2].
+- If the sources do not contain the answer, say so plainly. Do not fill gaps \
+from your own knowledge.
+- If no sources are provided, answer from your own knowledge and open with:
+  "No sources retrieved; answering from general knowledge."
+- Match the answer's length to the question. A factual lookup gets one or two \
+sentences. A comparison or a "how does X work" question gets a short structured \
+answer with the relevant detail.
+- Do not describe your process. No "based on the sources provided"."""
+
+def _as_result(raw: dict) -> dict:
+    """Translate one Tavily hit into the canonical result shape."""
+    return {
+        "source_type": "web",
+        "title": raw.get("title") or "(untitled)",
+        "url": raw.get("url") or "",
+        "content": (raw.get("content") or "").strip(),
+        "score": float(raw.get("score") or 0.0),
+    }
+
 def _normalise_route(raw: str) -> str:
     """Coerce arbitrary model output into a valid route name."""
     cleaned = raw.strip().strip('.`"\'').lower()
@@ -42,6 +67,29 @@ def _normalise_route(raw: str) -> str:
     print(f"[router]     WARN unparseable route {raw!r} -> {DEFAULT_ROUTE!r}")
     return DEFAULT_ROUTE
 
+def _format_sources(results: list[dict]) -> str:
+    """Render results as a numbered block for the prompt."""
+    if not results:
+        return "(no sources retrieved)"
+
+    lines = []
+    for i, r in enumerate(results, start=1):
+        lines.append(f"[{i}] {r['title']}\n    {r['url']}\n    {r['content']}")
+    return "\n\n".join(lines)
+
+def node(fn):
+    """Enforce the node contract: must return a dict."""
+    @functools.wraps(fn)
+    def wrapper(state):
+        result = fn(state)
+        if not isinstance(result, dict):
+            raise TypeError(
+                f"node {fn.__name__!r} returned {type(result).__name__}, expected dict"
+            )
+        return result
+    return wrapper
+
+@node
 def router(state: WarmupState) -> dict:
     """Decide whether this question needs live web search."""
     question = state["question"]
@@ -60,20 +108,47 @@ def router(state: WarmupState) -> dict:
     print(f"[router]     raw={raw!r} -> route={route!r}")
     return {"route": route}
 
+@node
 def search(state: WarmupState) -> dict:
     """Fetch web results. STUB — returns fixed data."""
-    print(f"[search]     searching for: {state['question'][:50]!r}")
-    return {
-        "search_results": [
-            {"title": "Stub result A", "url": "https://example.com/a",
-             "content": "Placeholder content A."},
-            {"title": "Stub result B", "url": "https://example.com/b",
-             "content": "Placeholder content B."},
-        ]
-    }
+    question = state['question']
 
+    try:
+        client = get_tavily()
+        response = client.search(
+            query=question,
+            max_results=TAVILY_MAX_RESULTS,
+            search_depth=TAVILY_SEARCH_DEPTH,
+        )
+        hits = response.get("results", [])
+        results = [_as_result(h) for h in hits]
+        results = [r for r in results if r["url"] and r["content"]]
+    except Exception as e:
+
+        print(f"[search]     ERROR {type(e).__name__}: {e} -> degrading to 0 results")
+        return {"search_results": []}
+
+    print(f"[search]     {len(results)} result(s) for {question[:40]!r}")
+    return {"search_results": results}
+
+@node
 def generation(state: WarmupState) -> dict:
     """Write the final answer. STUB — echoes what it received."""
-    n = len(state["search_results"])
-    print(f"[generation] composing answer from {n} result(s)")
-    return {"answer": f"Answer to {state['question']!r} using {n} source(s)."}
+    question = state['question']
+    results = state['search_results']
+
+    llm = get_llm(GENERATION_MODEL, temperature=0.0)
+
+    user_content = (
+        f"Question: {question}\n\n"
+        f"Sources:\n{_format_sources(results)}"
+    )
+
+    response = llm.invoke([
+        SystemMessage(content=GENERATION_SYSTEM),
+        HumanMessage(content=user_content),
+    ])
+
+    answer = response.content.strip()
+    print(f"[generation] {len(results)} source(s) -> {len(answer)} chars")
+    return {"answer": answer}
