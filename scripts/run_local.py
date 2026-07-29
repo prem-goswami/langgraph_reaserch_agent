@@ -1,24 +1,30 @@
+import sys
+
 from app.graph import build_graph
 
 app = build_graph()
 
+question = " ".join(sys.argv[1:]) or "What were the major AI model releases in 2025?"
+
 initial_state = {
-    "question": "What were the major AI model releases in 2025?",
+    "question": question,
     "route": "",
     "search_results": [],
     "answer": "",
 }
 
-print("=" * 60)
-print("STREAMING (one dict per superstep)")
-print("=" * 60)
+print("=" * 70)
+print(f"QUESTION: {question}")
+print("=" * 70)
+
+final = None
 for step in app.stream(initial_state):
-    print("  superstep output:", step)
+    for node_name, update in step.items():
+        print(f"  [{node_name}] -> {list(update.keys())}")
+    final = step
 
 print()
-print("=" * 60)
-print("FINAL STATE")
-print("=" * 60)
-final = app.invoke(initial_state)
-for k, v in final.items():
-    print(f"  {k}: {v}")
+print("=" * 70)
+print("ANSWER")
+print("=" * 70)
+print(final["generation"]["answer"])
