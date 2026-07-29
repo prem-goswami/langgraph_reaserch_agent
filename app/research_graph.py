@@ -3,7 +3,7 @@ from langgraph.graph import StateGraph, START, END
 from app.config import MAX_CORRECTIONS
 from app.research_state import ResearchState
 from app.research_nodes import (
-    query_analyzer, tavily_search, rag_retrieval, merge_and_rank, critic, 
+    query_analyzer, tavily_search, rag_retrieval, merge_and_rank, critic, generation
 )
 
 
@@ -17,7 +17,7 @@ def route_after_critic(state: ResearchState) -> Union[str, List[str]]:
 
     if verdict == "PASS" or count > MAX_CORRECTIONS:
         print(f"[edge]       verdict={verdict} count={count} -> generate")
-        return END                    # Phase 5: change to "generation"
+        return "generation"                    # Phase 5: change to "generation"
 
     print(f"[edge]       verdict={verdict} count={count} -> retry")
     return RETRY_TARGETS
@@ -30,6 +30,7 @@ def build_research_graph():
     builder.add_node("rag_retrieval", rag_retrieval)
     builder.add_node("merge_and_rank", merge_and_rank)
     builder.add_node("critic", critic)
+    builder.add_node("generation", generation)
 
     builder.add_edge(START, "query_analyzer")
 
@@ -48,6 +49,8 @@ def build_research_graph():
         "critic",
         route_after_critic,
     )
+
+    builder.add_edge("generation", END)
 
 
     return builder.compile()
