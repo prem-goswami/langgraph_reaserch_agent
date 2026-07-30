@@ -1,6 +1,7 @@
 from warmup.state import WarmupState
 from langchain_core.messages import SystemMessage, HumanMessage
-from app.config import ROUTER_MODEL, VALID_ROUTES, DEFAULT_ROUTE, TAVILY_MAX_RESULTS,TAVILY_SEARCH_DEPTH, GENERATION_MODEL
+from app.config import TAVILY_MAX_RESULTS,TAVILY_SEARCH_DEPTH, GENERATION_MODEL
+from warmup.config import ROUTER_MODEL, VALID_ROUTES, DEFAULT_ROUTE
 from app.llm import get_llm
 from warmup.search import get_tavily
 from app.contract import node
