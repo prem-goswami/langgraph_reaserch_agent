@@ -22,7 +22,7 @@ def route_after_critic(state: ResearchState) -> Union[str, List[str]]:
     print(f"[edge]       verdict={verdict} count={count} -> retry")
     return RETRY_TARGETS
 
-def build_research_graph():
+def build_research_graph(parallel: bool = True):
     builder = StateGraph(ResearchState)
 
     builder.add_node("query_analyzer", query_analyzer)
@@ -34,23 +34,20 @@ def build_research_graph():
 
     builder.add_edge(START, "query_analyzer")
 
-    # FAN-OUT: two edges from one node -> both run in the same superstep
-    builder.add_edge("query_analyzer", "tavily_search")
-    builder.add_edge("query_analyzer", "rag_retrieval")
-
-    # FAN-IN: both edges into one node -> runs once, after both complete
-    builder.add_edge("tavily_search", "merge_and_rank")
-    builder.add_edge("rag_retrieval", "merge_and_rank")
+    if parallel:
+        # FAN-OUT: both retrieval nodes in one superstep
+        builder.add_edge("query_analyzer", "tavily_search")
+        builder.add_edge("query_analyzer", "rag_retrieval")
+        builder.add_edge("tavily_search", "merge_and_rank")
+        builder.add_edge("rag_retrieval", "merge_and_rank")
+    else:
+        # SEQUENTIAL: a chain, one retrieval node per superstep
+        builder.add_edge("query_analyzer", "tavily_search")
+        builder.add_edge("tavily_search", "rag_retrieval")
+        builder.add_edge("rag_retrieval", "merge_and_rank")
 
     builder.add_edge("merge_and_rank", "critic")
-
-    # THE CYCLE: "retry" sends control back to BOTH retrieval nodes
-    builder.add_conditional_edges(
-        "critic",
-        route_after_critic,
-    )
-
+    builder.add_conditional_edges("critic", route_after_critic)
     builder.add_edge("generation", END)
-
 
     return builder.compile()

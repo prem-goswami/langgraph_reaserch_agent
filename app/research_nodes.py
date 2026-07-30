@@ -6,7 +6,7 @@ from tavily import AsyncTavilyClient
 from app.contract import node
 from app.config import (
     TAVILY_API_KEY, TAVILY_MAX_RESULTS, TAVILY_SEARCH_DEPTH,
-    RAG_BASE_URL, RAG_MIN_SCORE, RAG_TIMEOUT, TOP_K, CRITIC_MODEL,GENERATION_MODEL
+    RAG_BASE_URL, RAG_MIN_SCORE, RAG_TIMEOUT, TOP_K, CRITIC_MODEL,GENERATION_MODEL, ANALYZER_MODEL, MAX_SUB_QUESTIONS,RRF_K 
 )
 
 from app.research_state import ResearchState
@@ -20,23 +20,25 @@ def _sigmoid(logit: float) -> float:
     return 1.0 / (1.0 + math.exp(-logit))
 
 
-def _as_web_result(hit: dict) -> dict:
+def _as_web_result(hit: dict, found_by: str = "") -> dict:
     return {
         "source_type": "web",
         "title": hit.get("title") or "(untitled)",
         "url": hit.get("url") or "",
         "content": (hit.get("content") or "").strip(),
         "score": float(hit.get("score") or 0.0),
+        "found_by": found_by,                          
     }
 
 
-def _as_doc_result(chunk: dict) -> dict:
+def _as_doc_result(chunk: dict, found_by: str = "") -> dict:
     return {
         "source_type": "doc",
         "title": chunk.get("source") or "(document)",
         "url": chunk.get("chunk_id") or "",
         "content": (chunk.get("content_preview") or "").strip(),
         "score": _sigmoid(float(chunk.get("rerank_score") or -20.0)),
+        "found_by": found_by,                          
     }
 
 def _effective_queries(state: ResearchState) -> list[str]:
@@ -47,14 +49,87 @@ def _effective_queries(state: ResearchState) -> list[str]:
         return subs
     return subs + [feedback]
 
+ANALYZER_SYSTEM = """You split a research question into the minimum set of \
+search queries needed to answer it.
+
+Output one query per line, numbered. Nothing else — no preamble, no explanation.
+
+Split only when the question genuinely has separable parts:
+- It compares two things -> one query per thing.
+- It asks about distinct entities, time periods, or aspects -> one each.
+- It asks "why" or "how" about a specific event -> one query for the event, \
+one for the causes or mechanism.
+
+Do NOT split a question that asks for one thing. Return it as a single query, \
+lightly reworded into search terms. Over-splitting wastes retrieval and \
+dilutes the results.
+
+Write search queries, not questions. Drop question words and filler; keep \
+entity names, qualifiers, and dates.
+
+Maximum queries: {max_queries}
+
+Examples:
+
+Question: What is Walmart's 2026 e-commerce revenue?
+1. Walmart 2026 e-commerce revenue
+
+Question: How does Walmart's omnichannel strategy compare to Amazon's current \
+market position?
+1. Walmart omnichannel strategy
+2. Amazon current e-commerce market position
+
+Question: Why did Walmart's stock fall after the Q4 2026 earnings call?
+1. Walmart stock decline Q4 2026 earnings
+2. Walmart Q4 2026 earnings call analyst reaction"""
+
+
+def _parse_sub_questions(raw: str, original: str, max_n: int) -> list:
+    """Extract numbered queries from the analyzer's output."""
+    queries = []
+    for line in raw.strip().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        # strip a leading "1." / "1)" / "-" / "*"
+        cleaned = re.sub(r"^\s*(?:\d+[\.\)]|[-*])\s*", "", line).strip()
+        cleaned = cleaned.strip('"\'')
+        if cleaned and len(cleaned) > 3:
+            queries.append(cleaned)
+
+    if not queries:
+        print(f"[analyzer]   WARN unparseable output -> falling back to original")
+        return [original]
+
+    return queries[:max_n]
+
+
 @node
 def query_analyzer(state: ResearchState) -> dict:
-    """Split the question into sub-questions. STUB."""
-    q = state["question"]
-    subs = [q, f"{q} recent developments"]
-    print(f"[analyzer]   -> {len(subs)} sub-question(s)")
-    return {"sub_questions": subs}
+    """Decompose the question into the minimum set of search queries."""
+    question = state["question"]
 
+    llm = get_llm(ANALYZER_MODEL, temperature=0.0)
+
+    try:
+        response = llm.invoke([
+            SystemMessage(
+                content=ANALYZER_SYSTEM.format(max_queries=MAX_SUB_QUESTIONS)
+            ),
+            HumanMessage(content=f"Question: {question}"),
+        ])
+        subs = _parse_sub_questions(
+            response.content, question, MAX_SUB_QUESTIONS
+        )
+    except Exception as e:
+        print(f"[analyzer]   ERROR {type(e).__name__}: {e} -> using original question")
+        subs = [question]
+
+    print(f"[analyzer]   -> {len(subs)} query/queries")
+    for i, s in enumerate(subs, start=1):
+        print(f"[analyzer]     {i}. {s}")
+
+    return {"sub_questions": subs}
 
 @node
 async def tavily_search(state: ResearchState) -> dict:
@@ -73,7 +148,7 @@ async def tavily_search(state: ResearchState) -> dict:
                 search_depth=TAVILY_SEARCH_DEPTH,
             )
             raw_hits = response.get("results", [])
-            formatted_hits = [_as_web_result(hit) for hit in raw_hits]
+            formatted_hits = [_as_web_result(hit, query_text) for hit in raw_hits]
             return formatted_hits
 
         # Run search_single_query on all sub-questions at the exact same time
@@ -115,7 +190,7 @@ async def rag_retrieval(state: ResearchState) -> dict:
                 response.raise_for_status()
                 
                 sources = response.json().get("sources", [])
-                formatted_docs = [_as_doc_result(chunk) for chunk in sources]
+                formatted_docs = [_as_doc_result(chunk, query_text) for chunk in sources]
                 return formatted_docs
 
             # Execute RAG requests concurrently across all sub-questions
@@ -150,14 +225,39 @@ async def rag_retrieval(state: ResearchState) -> dict:
     print(f"[rag]        DONE   -> {len(valid_results)} result(s) ({dropped_count} below threshold)")
     return {"raw_results": valid_results}
 
+def _rrf_fuse(deduped: list) -> list:
+    """Reciprocal rank fusion over (source_type, sub_question) groups.
+
+    Ranking within each group means every source AND every sub-question
+    contributes its own best result. Prevents one sub-question's high-scoring
+    results from occupying all slots for a source.
+    """
+    groups = {}
+    for r in deduped:
+        key = (r["source_type"], r.get("found_by", ""))
+        groups.setdefault(key, []).append(r)
+
+    scored = []
+    for key, items in groups.items():
+        items.sort(key=lambda r: r["score"], reverse=True)
+        for rank, r in enumerate(items, start=1):
+            rrf = 1.0 / (RRF_K + rank)
+            scored.append((rrf, r["score"], rank, r))
+
+    # primary: fused score (rank tier). secondary: raw score, ordering only
+    # within a tier — it cannot promote a rank-3 item above a rank-1 item.
+    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+
+    return [(rank, r) for _, _, rank, r in scored]
+
 
 @node
 def merge_and_rank(state: ResearchState) -> dict:
-    """Dedupe across sources, rank by score, keep the top K."""
+    """Dedupe across sources, fuse by reciprocal rank, keep the top K."""
     raw = state["raw_results"]
 
     # --- dedupe, keeping the highest-scored copy of each source ---
-    best_by_key: dict[str, dict] = {}
+    best_by_key = {}
     for result in raw:
         key = (result.get("url") or "").rstrip("/")
         if not key:
@@ -169,9 +269,9 @@ def merge_and_rank(state: ResearchState) -> dict:
     deduped = list(best_by_key.values())
     duplicates_removed = len(raw) - len(deduped)
 
-    # --- rank across both sources ---
-    ranked = sorted(deduped, key=lambda r: r["score"], reverse=True)
-    top = ranked[:TOP_K]
+    # --- fuse across sources by rank, not by score value ---
+    fused = _rrf_fuse(deduped)
+    top = [r for _, r in fused[:TOP_K]]
 
     # --- diagnostics ---
     print(f"[merge]      in={len(raw)} deduped={len(deduped)} "
@@ -181,6 +281,10 @@ def merge_and_rank(state: ResearchState) -> dict:
         if scores:
             print(f"[merge]      {source_type}: n={len(scores)} "
                   f"min={min(scores):.3f} max={max(scores):.3f}")
+    for position, (source_rank, r) in enumerate(fused[:TOP_K], start=1):
+        print(f"[merge]      #{position} {r['source_type']}"
+              f"(rank {source_rank}, score {r['score']:.3f}) "
+              f"<- {r.get('found_by', '')[:40]}")
     composition = {}
     for r in top:
         composition[r["source_type"]] = composition.get(r["source_type"], 0) + 1

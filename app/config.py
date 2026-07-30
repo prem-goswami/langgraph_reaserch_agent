@@ -23,3 +23,8 @@ TOP_K = int(os.getenv("TOP_K", "5"))
 
 CRITIC_MODEL = os.getenv("CRITIC_MODEL", "gpt-4o-mini")
 MAX_CORRECTIONS = int(os.getenv("MAX_CORRECTIONS", "2"))
+
+ANALYZER_MODEL = os.getenv("ANALYZER_MODEL", "gpt-4o-mini")
+MAX_SUB_QUESTIONS = int(os.getenv("MAX_SUB_QUESTIONS", "3"))
+
+RRF_K = int(os.getenv("RRF_K", "60"))
