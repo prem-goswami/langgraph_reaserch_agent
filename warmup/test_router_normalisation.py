@@ -1,6 +1,6 @@
 import pytest
 
-from app.nodes import _normalise_route
+from warmup.nodes import _normalise_route
 
 
 @pytest.mark.parametrize("raw,expected", [

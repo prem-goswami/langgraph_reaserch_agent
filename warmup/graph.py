@@ -1,7 +1,7 @@
 from langgraph.graph import StateGraph, START, END
 
-from app.state import WarmupState
-from app.nodes import router, search, generation
+from warmup.state import WarmupState
+from warmup.nodes import router, search, generation
 
 def route_decision(state: WarmupState) -> str:
     """Conditional edge. Reads state, returns the name of the next branch."""

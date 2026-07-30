@@ -42,12 +42,12 @@ def _as_doc_result(chunk: dict, found_by: str = "") -> dict:
     }
 
 def _effective_queries(state: ResearchState) -> list[str]:
-    """Retrieval queries, extended with critic feedback on a retry pass."""
+    """Retrieval queries, with critic feedback substituted in on a retry."""
     subs = state["sub_questions"]
     feedback = state.get("critic_feedback", "")
     if not feedback:
         return subs
-    return subs + [feedback]
+    return (subs + [feedback])[:MAX_SUB_QUESTIONS]
 
 ANALYZER_SYSTEM = """You split a research question into the minimum set of \
 search queries needed to answer it.
@@ -66,6 +66,9 @@ dilutes the results.
 
 Write search queries, not questions. Drop question words and filler; keep \
 entity names, qualifiers, and dates.
+
+Do not add dates, years, industries, or other qualifiers the question did not \
+specify. "What problems did Walmart face?" is not a question about 2023.
 
 Maximum queries: {max_queries}
 
@@ -226,30 +229,41 @@ async def rag_retrieval(state: ResearchState) -> dict:
     return {"raw_results": valid_results}
 
 def _rrf_fuse(deduped: list) -> list:
-    """Reciprocal rank fusion over (source_type, sub_question) groups.
+    """Reciprocal rank fusion with source-interleaved tie handling.
 
-    Ranking within each group means every source AND every sub-question
-    contributes its own best result. Prevents one sub-question's high-scoring
-    results from occupying all slots for a source.
+    Items tie on fused score whenever they share a rank across groups. Sorting
+    a tie by raw score reintroduces cross-source comparison — the exact thing
+    RRF avoids — and dominates the top-K entirely when groups > K. So ties are
+    broken by round-robin across source types instead.
     """
     groups = {}
     for r in deduped:
         key = (r["source_type"], r.get("found_by", ""))
         groups.setdefault(key, []).append(r)
 
-    scored = []
-    for key, items in groups.items():
+    # rank within each group; collect by (rank tier -> source type)
+    tiers = {}
+    for (source_type, _), items in groups.items():
         items.sort(key=lambda r: r["score"], reverse=True)
         for rank, r in enumerate(items, start=1):
-            rrf = 1.0 / (RRF_K + rank)
-            scored.append((rrf, r["score"], rank, r))
+            tiers.setdefault(rank, {}).setdefault(source_type, []).append((rank, r))
 
-    # primary: fused score (rank tier). secondary: raw score, ordering only
-    # within a tier — it cannot promote a rank-3 item above a rank-1 item.
-    scored.sort(key=lambda t: (t[0], t[1]), reverse=True)
+    ordered = []
+    for rank in sorted(tiers):
+        by_source = tiers[rank]
 
-    return [(rank, r) for _, _, rank, r in scored]
+        # within one source, raw scores ARE comparable — same model, same scale
+        for source_type in by_source:
+            by_source[source_type].sort(key=lambda pair: pair[1]["score"], reverse=True)
 
+        # round-robin across sources so no source can take a whole tier
+        source_names = sorted(by_source)
+        while any(by_source[st] for st in source_names):
+            for st in source_names:
+                if by_source[st]:
+                    ordered.append(by_source[st].pop(0))
+
+    return ordered
 
 @node
 def merge_and_rank(state: ResearchState) -> dict:

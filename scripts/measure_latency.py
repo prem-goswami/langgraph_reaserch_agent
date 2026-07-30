@@ -9,6 +9,8 @@ import statistics
 import time
 
 from app.research_graph import build_research_graph
+from app.research_state import initial_state
+
 
 
 # One distinct question per trial, so the search provider cannot serve a
@@ -27,20 +29,6 @@ QUESTIONS = [
 
 COOLDOWN = 6.0     # seconds between runs, to stay under the RAG rate limit
 
-
-def fresh_state(question: str) -> dict:
-    return {
-        "question": question,
-        "sub_questions": [],
-        "raw_results": [],
-        "ranked_results": [],
-        "critic_verdict": "",
-        "critic_feedback": "",
-        "correction_count": 0,
-        "report": "",
-    }
-
-
 async def timed_run(app, question: str):
     """Run once. Returns (total_seconds, {node_name: seconds_since_previous}).
 
@@ -55,7 +43,7 @@ async def timed_run(app, question: str):
     t_start = time.perf_counter()
     t_prev = t_start
 
-    async for chunk in app.astream(fresh_state(question)):
+    async for chunk in app.astream(initial_state(question)):
         t_now = time.perf_counter()
         for name, update in chunk.items():
             marks[name] = t_now - t_prev

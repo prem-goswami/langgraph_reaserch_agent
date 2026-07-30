@@ -3,6 +3,8 @@ import sys
 import time
 
 from app.research_graph import build_research_graph
+from app.research_state import initial_state
+
 
 
 async def main():
@@ -13,24 +15,13 @@ async def main():
         "Amazon's current market position?"
     )
 
-    initial_state = {
-        "question": question,
-        "sub_questions": [],
-        "raw_results": [],
-        "ranked_results": [],
-        "critic_verdict": "",
-        "critic_feedback": "",
-        "correction_count": 0,
-        "report": "",
-    }
-
     print("=" * 70)
     print(f"QUESTION: {question}")
     print("=" * 70)
 
     t0 = time.perf_counter()
     final_state = None
-    async for step in app.astream(initial_state):
+    async for step in app.astream(initial_state(question)):
         for name, update in step.items():
             print(f"  SUPERSTEP -> {{{name}: {list(update.keys())}}}")
             if name == "generation":

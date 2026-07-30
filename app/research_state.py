@@ -11,3 +11,17 @@ class ResearchState(TypedDict):
     critic_feedback: str
     correction_count: int
     report: str
+
+
+def initial_state(question: str) -> ResearchState:
+    """Construct a fully-seeded initial state. The single place keys are defaulted."""
+    return {
+        "question": question,
+        "sub_questions": [],
+        "raw_results": [],
+        "ranked_results": [],
+        "critic_verdict": "",
+        "critic_feedback": "",
+        "correction_count": 0,
+        "report": "",
+    }

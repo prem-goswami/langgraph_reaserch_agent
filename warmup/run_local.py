@@ -1,6 +1,6 @@
 import sys
 
-from app.graph import build_graph
+from warmup.graph import build_graph
 
 app = build_graph()
 
